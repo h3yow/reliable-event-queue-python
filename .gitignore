@@ -7,3 +7,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地队列持久化文件
+queue.db
+queue.db-wal
+queue.db-shm
+*.db
