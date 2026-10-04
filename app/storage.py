@@ -11,12 +11,24 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from app.models import CursorState, DeadLetter, DLQStatus, Event, EventStatus
+from app.models import (
+    CursorState,
+    DeadLetter,
+    DLQStatus,
+    Event,
+    EventStatus,
+    HeldEvent,
+    QueueOverview,
+    Session,
+    SessionOverview,
+    SessionStatus,
+)
 
 # 从 PROCESSING 回收的认领事件（claim_at）超过该时间视为消费者崩溃
 EVENT_COLUMNS = (
     "id, `key`, type, payload, status, attempts, available_at, last_error, "
-    "result, offset, created_at, updated_at, claimed_at, dedup_expires_at"
+    "result, offset, created_at, updated_at, claimed_at, dedup_expires_at, "
+    "session_id, lease_expires_at"
 )
 
 
@@ -34,6 +46,8 @@ def _row_to_event(row: sqlite3.Row) -> Event:
         offset=row["offset"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        session_id=row["session_id"] or "",
+        lease_expires_at=row["lease_expires_at"],
     )
 
 
@@ -95,7 +109,29 @@ class Storage:
                 name   TEXT PRIMARY KEY,
                 value  TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id          TEXT PRIMARY KEY,
+                started_at  REAL NOT NULL,
+                closed_at   REAL NOT NULL DEFAULT 0,
+                status      TEXT NOT NULL
+            );
             """
+        )
+        # 兼容旧库：为已存在的 events 表补充会话 / 租约列
+        cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(events)")
+        }
+        if "session_id" not in cols:
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "lease_expires_at" not in cols:
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN lease_expires_at REAL NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)"
         )
         conn.commit()
 
@@ -283,14 +319,82 @@ class Storage:
             return int(row["m"])
 
     # ------------------------------------------------------------------ #
+    # 会话
+    # ------------------------------------------------------------------ #
+    def create_session(self, session_id: str, now: float) -> Session:
+        with self._tx_lock:
+            self.conn.execute(
+                "INSERT INTO sessions(id, started_at, closed_at, status) "
+                "VALUES (?,?,0,?)",
+                (session_id, now, SessionStatus.ACTIVE.value),
+            )
+            self.conn.commit()
+        return Session(
+            id=session_id, started_at=now, status=SessionStatus.ACTIVE
+        )
+
+    def close_session(self, session_id: str, now: float) -> None:
+        with self._tx_lock:
+            self.conn.execute(
+                "UPDATE sessions SET status=?, closed_at=? WHERE id=?",
+                (SessionStatus.CLOSED.value, now, session_id),
+            )
+            self.conn.commit()
+
+    def get_session(self, session_id: str) -> Session | None:
+        with self._tx_lock:
+            row = self.conn.execute(
+                "SELECT id, started_at, closed_at, status FROM sessions "
+                "WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return Session(
+                id=row["id"], started_at=row["started_at"],
+                status=SessionStatus(row["status"]), closed_at=row["closed_at"],
+            )
+
+    def release_session_events(self, session_id: str, now: float) -> int:
+        """会话正常退出：把它仍持有的 PROCESSING 事件退回 FAILED
+        （立即可被其他会话认领），返回释放条数。"""
+        with self._tx_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self.conn.execute(
+                    """
+                    UPDATE events
+                    SET status=?, claimed_at=0, updated_at=?, available_at=?,
+                        session_id='', lease_expires_at=0
+                    WHERE status=? AND session_id=?
+                    """,
+                    (
+                        EventStatus.FAILED.value, now, now,
+                        EventStatus.PROCESSING.value, session_id,
+                    ),
+                )
+                self.conn.execute("COMMIT")
+                return cur.rowcount
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    # ------------------------------------------------------------------ #
     # 消费
     # ------------------------------------------------------------------ #
-    def claim_due(self, now: float, limit: int) -> list[Event]:
+    def claim_due(
+        self,
+        now: float,
+        limit: int,
+        session_id: str = "",
+        lease_duration: float = 0.0,
+    ) -> list[Event]:
         """原子地认领至多 limit 条到期可投递事件（PENDING 或退避到期的
         FAILED）。使用单条 UPDATE ... RETURNING 保证多消费者下每条事件
-        只会被一个消费者拿到。"""
+        只会被一个消费者拿到。认领时记录持有会话与租约到期时间。"""
         if limit <= 0:
             return []
+        lease_expires_at = now + lease_duration if lease_duration > 0 else 0.0
         with self._tx_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -300,7 +404,9 @@ class Storage:
                         status=?,
                         claimed_at=?,
                         updated_at=?,
-                        attempts=attempts+1
+                        attempts=attempts+1,
+                        session_id=?,
+                        lease_expires_at=?
                     WHERE id IN (
                         SELECT id FROM events
                         WHERE status IN (?, ?) AND available_at<=?
@@ -311,6 +417,7 @@ class Storage:
                     """,
                     (
                         EventStatus.PROCESSING.value, now, now,
+                        session_id, lease_expires_at,
                         EventStatus.PENDING.value, EventStatus.FAILED.value,
                         now, limit,
                     ),
@@ -321,34 +428,61 @@ class Storage:
                 raise
         return [_row_to_event(r) for r in rows]
 
-    def heartbeat(self, event_id: str, now: float) -> None:
+    def heartbeat(
+        self,
+        event_id: str,
+        now: float,
+        session_id: str = "",
+        lease_duration: float = 0.0,
+    ) -> None:
+        """续约：刷新认领时间，并在指定会话与租约时长时延长租约。"""
+        lease_expires_at = now + lease_duration if lease_duration > 0 else 0.0
         with self._tx_lock:
-            self.conn.execute(
-                "UPDATE events SET claimed_at=? WHERE id=? AND status=?",
-                (now, event_id, EventStatus.PROCESSING.value),
-            )
+            if session_id:
+                self.conn.execute(
+                    "UPDATE events SET claimed_at=?, lease_expires_at=? "
+                    "WHERE id=? AND status=? AND session_id=?",
+                    (
+                        now, lease_expires_at, event_id,
+                        EventStatus.PROCESSING.value, session_id,
+                    ),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE events SET claimed_at=? WHERE id=? AND status=?",
+                    (now, event_id, EventStatus.PROCESSING.value),
+                )
             self.conn.commit()
 
-    def mark_succeeded(self, event_id: str, result: str, now: float) -> bool:
+    def mark_succeeded(
+        self, event_id: str, result: str, now: float, session_id: str = ""
+    ) -> bool:
         """仅当事件仍处于 PROCESSING 时才能落成功结果，防止重复生效。
 
+        传入 session_id 时还要求事件仍由该会话持有：租约过期被其他会话
+        接管后，旧会话的成功写入会被拒绝，避免同一事件生效两次。
         返回 True 表示本次调用真正把事件置为成功；False 表示事件已处于
-        终态（成功结果不可变）。
+        终态（成功结果不可变）或已被其他会话接管。
         """
+        guard = "AND session_id=?" if session_id else ""
+        params: tuple = (
+            (EventStatus.SUCCEEDED.value, result, now, event_id,
+             EventStatus.PROCESSING.value, session_id)
+            if session_id else
+            (EventStatus.SUCCEEDED.value, result, now, event_id,
+             EventStatus.PROCESSING.value)
+        )
         with self._tx_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self.conn.execute(
-                    """
+                    f"""
                     UPDATE events
                     SET status=?, result=?, last_error='', updated_at=?,
-                        claimed_at=0
-                    WHERE id=? AND status=?
+                        claimed_at=0, session_id='', lease_expires_at=0
+                    WHERE id=? AND status=? {guard}
                     """,
-                    (
-                        EventStatus.SUCCEEDED.value, result, now, event_id,
-                        EventStatus.PROCESSING.value,
-                    ),
+                    params,
                 )
                 self.conn.execute("COMMIT")
                 return cur.rowcount == 1
@@ -357,25 +491,43 @@ class Storage:
                 raise
 
     def mark_retry(
-        self, event_id: str, error: str, available_at: float, now: float
+        self,
+        event_id: str,
+        error: str,
+        available_at: float,
+        now: float,
+        session_id: str = "",
     ) -> None:
+        guard = "AND session_id=?" if session_id else ""
+        params: tuple = (
+            (EventStatus.FAILED.value, error, available_at, now, event_id,
+             EventStatus.PROCESSING.value, session_id)
+            if session_id else
+            (EventStatus.FAILED.value, error, available_at, now, event_id,
+             EventStatus.PROCESSING.value)
+        )
         with self._tx_lock:
             self.conn.execute(
-                """
+                f"""
                 UPDATE events
                 SET status=?, last_error=?, available_at=?, updated_at=?,
-                    claimed_at=0
-                WHERE id=? AND status=?
+                    claimed_at=0, session_id='', lease_expires_at=0
+                WHERE id=? AND status=? {guard}
                 """,
-                (
-                    EventStatus.FAILED.value, error, available_at, now,
-                    event_id, EventStatus.PROCESSING.value,
-                ),
+                params,
             )
             self.conn.commit()
 
-    def mark_dead(self, event_id: str, error: str, now: float) -> None:
+    def mark_dead(
+        self, event_id: str, error: str, now: float, session_id: str = ""
+    ) -> None:
         """进入隔离区：事件置 DEAD，并写入/更新 dead_letters。"""
+        guard = "AND session_id=?" if session_id else ""
+        params: tuple = (
+            (EventStatus.DEAD.value, error, now, event_id, session_id)
+            if session_id else
+            (EventStatus.DEAD.value, error, now, event_id)
+        )
         with self._tx_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -386,12 +538,13 @@ class Storage:
                 if row is None:
                     raise KeyError(event_id)
                 self.conn.execute(
-                    """
+                    f"""
                     UPDATE events
-                    SET status=?, last_error=?, updated_at=?, claimed_at=0
-                    WHERE id=?
+                    SET status=?, last_error=?, updated_at=?, claimed_at=0,
+                        session_id='', lease_expires_at=0
+                    WHERE id=? {guard}
                     """,
-                    (EventStatus.DEAD.value, error, now, event_id),
+                    params,
                 )
                 self.conn.execute(
                     """
@@ -423,7 +576,8 @@ class Storage:
                 self.conn.execute(
                     """
                     UPDATE events
-                    SET status=?, available_at=?, claimed_at=0, updated_at=?
+                    SET status=?, available_at=?, claimed_at=0, updated_at=?,
+                        session_id='', lease_expires_at=0
                     WHERE id=? AND status=?
                     """,
                     (
@@ -445,20 +599,38 @@ class Storage:
             self.conn.commit()
 
     def recover_orphans(self, now: float, timeout: float) -> int:
-        """重启/周期性恢复：把认领超时的 PROCESSING 事件退回 FAILED
-        （attempts 已在认领时增加），等待退避后重新投递。返回回收条数。"""
+        """重启/周期性恢复：回收 PROCESSING 中的孤儿事件，退回 FAILED
+        （attempts 已在认领时增加），立即可被新会话认领。返回回收条数。
+
+        孤儿判定（满足任一）：
+        - 持有会话已不存在或已关闭（进程被强杀 / 重启）：立即接管，
+          不需要等待租约到期；
+        - 租约已到期（lease_expires_at < now）：会话失联；
+        - 旧格式数据兜底：无会话信息且认领时间超过 timeout。
+        """
         with self._tx_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self.conn.execute(
                     """
                     UPDATE events
-                    SET status=?, claimed_at=0, updated_at=?, available_at=?
-                    WHERE status=? AND claimed_at>0 AND claimed_at<?
+                    SET status=?, claimed_at=0, updated_at=?, available_at=?,
+                        session_id='', lease_expires_at=0
+                    WHERE status=?
+                      AND (
+                          (session_id != '' AND session_id NOT IN (
+                              SELECT id FROM sessions WHERE status=?
+                          ))
+                          OR (lease_expires_at > 0 AND lease_expires_at < ?)
+                          OR (session_id = '' AND claimed_at > 0
+                              AND claimed_at < ?)
+                      )
                     """,
                     (
                         EventStatus.FAILED.value, now, now,
-                        EventStatus.PROCESSING.value, now - timeout,
+                        EventStatus.PROCESSING.value,
+                        SessionStatus.ACTIVE.value,
+                        now, now - timeout,
                     ),
                 )
                 self.conn.execute("COMMIT")
@@ -504,6 +676,105 @@ class Storage:
                     )
                 )
             return result
+
+    # ------------------------------------------------------------------ #
+    # 运行概览（只读一致快照）
+    # ------------------------------------------------------------------ #
+    def snapshot_overview(self, now: float) -> QueueOverview:
+        """在单个读事务内采集运行概览，并发消费 / 重放同时进行时
+        数字与明细仍来自同一快照，不会读到改到一半的状态。"""
+        with self._tx_lock:
+            self.conn.execute("BEGIN DEFERRED")
+            try:
+                counts = {s.value: 0 for s in EventStatus}
+                for row in self.conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM events GROUP BY status"
+                ):
+                    counts[row["status"]] = int(row["n"])
+
+                backlog = (
+                    counts[EventStatus.PENDING.value]
+                    + counts[EventStatus.FAILED.value]
+                )
+
+                row = self.conn.execute(
+                    "SELECT MIN(created_at) AS oldest FROM events "
+                    "WHERE status=?",
+                    (EventStatus.PENDING.value,),
+                ).fetchone()
+                oldest_pending_age = (
+                    max(0.0, now - float(row["oldest"]))
+                    if row["oldest"] is not None else None
+                )
+
+                cur_row = self.conn.execute(
+                    "SELECT value FROM meta WHERE name='cursor'"
+                ).fetchone()
+                cursor = int(cur_row["value"]) if cur_row else 0
+                max_row = self.conn.execute(
+                    "SELECT COALESCE(MAX(offset), 0) AS m FROM events"
+                ).fetchone()
+                max_offset = int(max_row["m"])
+
+                sessions: list[SessionOverview] = []
+                sess_rows = self.conn.execute(
+                    "SELECT id, started_at, status FROM sessions "
+                    "ORDER BY started_at"
+                ).fetchall()
+                held_rows = self.conn.execute(
+                    f"SELECT {EVENT_COLUMNS} FROM events "
+                    "WHERE status=? AND session_id != '' ORDER BY offset",
+                    (EventStatus.PROCESSING.value,),
+                ).fetchall()
+                held_by_session: dict[str, list[HeldEvent]] = {}
+                for hr in held_rows:
+                    ev = _row_to_event(hr)
+                    held_by_session.setdefault(ev.session_id, []).append(
+                        HeldEvent(
+                            event_id=ev.id,
+                            key=ev.key,
+                            offset=ev.offset,
+                            attempts=ev.attempts,
+                            lease_expires_at=ev.lease_expires_at,
+                            lease_remaining=ev.lease_expires_at - now,
+                        )
+                    )
+                for sr in sess_rows:
+                    sessions.append(
+                        SessionOverview(
+                            session_id=sr["id"],
+                            status=SessionStatus(sr["status"]),
+                            started_at=sr["started_at"],
+                            held_events=held_by_session.get(sr["id"], []),
+                        )
+                    )
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return QueueOverview(
+            now=now,
+            counts=counts,
+            backlog=backlog,
+            oldest_pending_age=oldest_pending_age,
+            cursor=cursor,
+            max_offset=max_offset,
+            cursor_gap=max_offset - cursor,
+            sessions=sessions,
+        )
+
+    def cursor_blockers(self, value: int) -> list[tuple[int, str, str]]:
+        """返回位点 value 之前（含）所有未到终态（非 SUCCEEDED）的事件，
+        按位点升序，用于位点提交前的安全检查与拒绝说明。"""
+        with self._tx_lock:
+            rows = self.conn.execute(
+                "SELECT offset, `key`, status FROM events "
+                "WHERE offset<=? AND status!=? ORDER BY offset",
+                (value, EventStatus.SUCCEEDED.value),
+            ).fetchall()
+            return [
+                (int(r["offset"]), r["key"], r["status"]) for r in rows
+            ]
 
     # ------------------------------------------------------------------ #
     # 位点

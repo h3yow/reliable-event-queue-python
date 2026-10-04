@@ -25,3 +25,16 @@ class CursorRegressionError(Exception):
 
 class CursorOutOfRangeError(Exception):
     """位点超出已知范围时抛出。"""
+
+
+class CursorBlockedError(Exception):
+    """位点提交被未完成事件阻挡时抛出。
+
+    blockers 为阻挡事件的明细列表，元素为
+    (offset, key, status) 三元组，便于排障定位。
+    """
+
+    def __init__(self, message: str, blockers: list[tuple[int, str, str]]):
+        super().__init__(message)
+        self.message = message
+        self.blockers = blockers

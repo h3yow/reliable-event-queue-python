@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.errors import (
+    CursorBlockedError,
     CursorOutOfRangeError,
     CursorRegressionError,
     HandlerError,
@@ -31,6 +32,7 @@ from app.models import (
     Event,
     EventStatus,
     ProcessOutcome,
+    QueueOverview,
     ReceiveResult,
 )
 from app.storage import Storage
@@ -75,6 +77,7 @@ class ReliableQueue:
         self._clock = clock or time.time
         self._started = False
         self._cursor_lock = threading.Lock()
+        self.session_id: str = ""
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -83,18 +86,39 @@ class ReliableQueue:
         if self._started:
             return
         self.storage.init_schema()
+        # 每次启动即一个独立消费者会话
+        self.session_id = f"sess-{uuid.uuid4().hex[:12]}"
+        self.storage.create_session(self.session_id, self._clock())
+        # 接管：死亡会话持有、租约过期或认领超时的事件立即回收重投，
+        # 不等漫长的处理超时
         recovered = self.storage.recover_orphans(
             self._clock(), self.processing_timeout
         )
         if recovered:
             logger.warning(
-                "恢复认领超时事件回重试队列 count=%d", recovered
+                "恢复孤儿事件回重试队列 count=%d session=%s",
+                recovered, self.session_id,
             )
         self._started = True
-        logger.info("可靠队列已启动 cursor=%d", self.get_cursor().value)
+        logger.info(
+            "可靠队列已启动 session=%s cursor=%d",
+            self.session_id, self.get_cursor().value,
+        )
 
     def close(self) -> None:
         if self._started:
+            now = self._clock()
+            # 干净收尾：释放本会话仍持有的事件，使其立即可被接管
+            released = self.storage.release_session_events(
+                self.session_id, now
+            )
+            if released:
+                logger.info(
+                    "会话退出释放持有事件 count=%d session=%s",
+                    released, self.session_id,
+                )
+            self.storage.close_session(self.session_id, now)
+            logger.info("会话已关闭 session=%s", self.session_id)
             self.storage.close()
             self._started = False
 
@@ -167,9 +191,17 @@ class ReliableQueue:
     def process_once(
         self, handler: EventHandler, limit: int = 1
     ) -> list[ProcessOutcome]:
-        """认领并处理至多 limit 条到期事件，逐条记录处理结果。"""
+        """认领并处理至多 limit 条到期事件，逐条记录处理结果。
+
+        认领时以当前会话名义登记租约（时长 = processing_timeout），
+        租约内其他会话不会拿到同一事件。
+        """
         now = self._clock()
-        events = self.storage.claim_due(now, limit)
+        events = self.storage.claim_due(
+            now, limit,
+            session_id=self.session_id,
+            lease_duration=self.processing_timeout,
+        )
         outcomes: list[ProcessOutcome] = []
         for event in events:
             outcomes.append(self._handle_event(event, handler))
@@ -205,8 +237,8 @@ class ReliableQueue:
         """处理一条已认领事件，所有分支均给出终局状态并落盘。"""
         now = self._clock()
         logger.info(
-            "开始处理 key=%s offset=%d attempts=%d",
-            event.key, event.offset, event.attempts,
+            "开始处理 key=%s offset=%d attempts=%d session=%s",
+            event.key, event.offset, event.attempts, self.session_id,
         )
         try:
             result = handler(event)
@@ -239,10 +271,13 @@ class ReliableQueue:
                 result=stored.result,
             )
 
-        ok = self.storage.mark_succeeded(event.id, result, self._clock())
+        ok = self.storage.mark_succeeded(
+            event.id, result, self._clock(), session_id=self.session_id
+        )
         if not ok:
             logger.error(
-                "成功写入被终态守护拒绝 key=%s offset=%d", event.key, event.offset
+                "成功写入被终态/会话守护拒绝 key=%s offset=%d session=%s",
+                event.key, event.offset, self.session_id,
             )
             refreshed = self.storage.get_event(event.id)
             return ProcessOutcome(
@@ -268,7 +303,10 @@ class ReliableQueue:
         can_retry = retryable and attempts < self.retry_policy.max_attempts
         if can_retry:
             available_at = now + self.retry_policy.delay_for(attempts)
-            self.storage.mark_retry(event.id, error, available_at, now)
+            self.storage.mark_retry(
+                event.id, error, available_at, now,
+                session_id=self.session_id,
+            )
             logger.warning(
                 "%s key=%s offset=%d attempts=%d next_retry_in=%.3fs",
                 detail, event.key, event.offset, attempts,
@@ -278,7 +316,7 @@ class ReliableQueue:
                 event_id=event.id, key=event.key, status=EventStatus.FAILED,
                 attempts=attempts, error=error, requeued=True,
             )
-        self.storage.mark_dead(event.id, error, now)
+        self.storage.mark_dead(event.id, error, now, session_id=self.session_id)
         logger.error(
             "进入隔离区 key=%s offset=%d attempts=%d reason=%s error=%s",
             event.key, event.offset, attempts,
@@ -309,7 +347,11 @@ class ReliableQueue:
             )
         now = self._clock()
         self.storage.reset_for_replay(event_id, now)
-        claimed = self.storage.claim_due(now, 1000)
+        claimed = self.storage.claim_due(
+            now, 1000,
+            session_id=self.session_id,
+            lease_duration=self.processing_timeout,
+        )
         target = next((e for e in claimed if e.id == event_id), None)
         if target is None:  # 并发等极端情况下兜底
             target = self.storage.get_event(event_id)
@@ -333,6 +375,14 @@ class ReliableQueue:
         return self.storage.list_dead_letters(status_filter)
 
     # ------------------------------------------------------------------ #
+    # 运行概览（只读一致快照）
+    # ------------------------------------------------------------------ #
+    def overview(self) -> QueueOverview:
+        """返回队列运行概览：各状态数量、积压、最老待处理等待时长、
+        位点差距与各会话持有事件 / 租约状态。单事务快照，并发下一致。"""
+        return self.storage.snapshot_overview(self._clock())
+
+    # ------------------------------------------------------------------ #
     # 位点
     # ------------------------------------------------------------------ #
     def get_cursor(self) -> CursorState:
@@ -343,6 +393,9 @@ class ReliableQueue:
 
         - 回退（小于当前位点）：拒绝，抛 CursorRegressionError
         - 超出已知最大位点：拒绝，抛 CursorOutOfRangeError
+        - 目标位置之前（含）仍有未到终态的事件（PENDING / PROCESSING /
+          FAILED / DEAD）：拒绝，抛 CursorBlockedError 并列出阻挡事件
+        - 重复提交当前位点：幂等成功（无操作）
         """
         with self._cursor_lock:
             current = self.storage.get_cursor().value
@@ -355,6 +408,20 @@ class ReliableQueue:
                 raise CursorOutOfRangeError(
                     f"拒绝位点跳跃：请求提交 {value} 超出最大已知位点 "
                     f"{self.storage.max_offset()}"
+                )
+            if value == current:
+                # 幂等重复提交：直接成功，不产生变更
+                return CursorState(value=value, updated_at=self._clock())
+            blockers = self.storage.cursor_blockers(value)
+            if blockers:
+                detail = ", ".join(
+                    f"offset={o} key={k} status={s}" for o, k, s in blockers
+                )
+                raise CursorBlockedError(
+                    f"拒绝位点提交：目标位置 {value} 之前还有 "
+                    f"{len(blockers)} 条事件未到终态（{detail}）；"
+                    "只有前面事件全部确认成功后才允许提交",
+                    blockers,
                 )
             now = self._clock()
             self.storage.commit_cursor(value, now)

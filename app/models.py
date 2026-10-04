@@ -34,6 +34,13 @@ class DuplicateReason(str, Enum):
     DEDUP_WINDOW = "DEDUP_WINDOW"      # 去重窗口内再次投递
 
 
+class SessionStatus(str, Enum):
+    """消费者会话状态。"""
+
+    ACTIVE = "ACTIVE"    # 会话存活，可认领 / 持有事件
+    CLOSED = "CLOSED"    # 会话已正常退出（或被判定死亡并接管）
+
+
 @dataclass
 class Event:
     """一条待处理的外部事件。"""
@@ -50,6 +57,8 @@ class Event:
     last_error: str = ""
     result: str = ""             # 成功处理结果（成功后不可变）
     offset: int = 0              # 单调位点，接收顺序分配
+    session_id: str = ""         # 当前持有该事件的消费者会话（PROCESSING 时有效）
+    lease_expires_at: float = 0.0  # 租约到期时间；超时未被续约则会被回收接管
 
 
 @dataclass
@@ -96,3 +105,49 @@ class ProcessOutcome:
     error: str = ""
     requeued: bool = False
     dead: bool = False
+
+
+@dataclass
+class Session:
+    """一个消费者会话：每次队列服务启动即创建一个。"""
+
+    id: str
+    started_at: float
+    status: SessionStatus = SessionStatus.ACTIVE
+    closed_at: float = 0.0
+
+
+@dataclass
+class HeldEvent:
+    """会话当前持有（PROCESSING）的一条事件及其租约状态。"""
+
+    event_id: str
+    key: str
+    offset: int
+    attempts: int
+    lease_expires_at: float
+    lease_remaining: float     # 租约剩余秒数（<=0 表示已到期，即将被回收）
+
+
+@dataclass
+class SessionOverview:
+    """单个会话在运行概览中的视图。"""
+
+    session_id: str
+    status: SessionStatus
+    started_at: float
+    held_events: list[HeldEvent] = field(default_factory=list)
+
+
+@dataclass
+class QueueOverview:
+    """只读运行概览：单事务一致快照。"""
+
+    now: float
+    counts: dict[str, int]            # 各状态事件数量（含 0 值状态）
+    backlog: int                      # 积压 = PENDING + FAILED（等待投递/重试）
+    oldest_pending_age: float | None  # 最老一条 PENDING 已等待秒数；无则 None
+    cursor: int                       # 已确认位点
+    max_offset: int                   # 最新接收位点
+    cursor_gap: int                   # max_offset - cursor
+    sessions: list[SessionOverview] = field(default_factory=list)
