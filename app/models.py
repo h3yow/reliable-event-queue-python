@@ -50,6 +50,8 @@ class Event:
     last_error: str = ""
     result: str = ""             # 成功处理结果（成功后不可变）
     offset: int = 0              # 单调位点，接收顺序分配
+    session_id: str = ""         # 当前持有该事件的消费者会话（PROCESSING 时有效）
+    lease_expires_at: float = 0.0  # 租约到期时间；到期后其他会话可接管
 
 
 @dataclass
@@ -82,6 +84,61 @@ class CursorState:
 
     value: int = 0
     updated_at: float = 0.0
+
+
+class SessionStatus(str, Enum):
+    """消费者会话状态。"""
+
+    ACTIVE = "ACTIVE"    # 会话存活，可认领 / 持有事件
+    CLOSED = "CLOSED"    # 会话已正常退出（干净收尾）
+
+
+@dataclass
+class Session:
+    """一次消费者会话：消费方每启动一次即一个独立会话。"""
+
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    started_at: float = 0.0
+    last_heartbeat: float = 0.0
+    closed_at: float = 0.0
+    status: SessionStatus = SessionStatus.ACTIVE
+
+
+@dataclass
+class HeldEvent:
+    """会话当前占着的事件及其租约状态（运行概览明细）。"""
+
+    event_id: str
+    key: str
+    offset: int
+    attempts: int
+    lease_expires_at: float
+    lease_remaining: float    # 租约剩余秒数（<=0 表示已到期、可被接管）
+
+
+@dataclass
+class SessionView:
+    """运行概览中的单个会话视图。"""
+
+    session_id: str
+    status: SessionStatus
+    started_at: float
+    last_heartbeat: float
+    held_events: list[HeldEvent] = field(default_factory=list)
+
+
+@dataclass
+class QueueOverview:
+    """只读运行概览：在单个读事务内采集的一致快照。"""
+
+    now: float = 0.0
+    counts: dict[str, int] = field(default_factory=dict)  # 各状态事件数量
+    backlog: int = 0                  # 积压：PENDING + FAILED（待投递/待重试）
+    oldest_pending_wait: float = 0.0  # 最老一条待处理事件已等待秒数（无则 0）
+    cursor: int = 0                   # 已确认位点
+    max_offset: int = 0               # 最新接收位置
+    cursor_gap: int = 0               # max_offset - cursor
+    sessions: list[SessionView] = field(default_factory=list)
 
 
 @dataclass

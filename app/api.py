@@ -7,11 +7,16 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from app.errors import CursorOutOfRangeError, CursorRegressionError
+from app.errors import (
+    CursorBlockedError,
+    CursorOutOfRangeError,
+    CursorRegressionError,
+)
 from app.models import (
     DeadLetter,
     Event,
     ProcessOutcome,
+    QueueOverview,
     ReceiveResult,
 )
 from app.service import EventHandler, ReliableQueue
@@ -41,6 +46,8 @@ def event_to_dict(e: Event) -> dict[str, Any]:
         "result": e.result,
         "created_at": e.created_at,
         "updated_at": e.updated_at,
+        "session_id": e.session_id,
+        "lease_expires_at": e.lease_expires_at,
     }
 
 
@@ -79,6 +86,38 @@ def dead_letter_to_dict(d: DeadLetter) -> dict[str, Any]:
     }
 
 
+def overview_to_dict(o: QueueOverview) -> dict[str, Any]:
+    return {
+        "now": o.now,
+        "counts": o.counts,
+        "backlog": o.backlog,
+        "oldest_pending_wait": o.oldest_pending_wait,
+        "cursor": o.cursor,
+        "max_offset": o.max_offset,
+        "cursor_gap": o.cursor_gap,
+        "sessions": [
+            {
+                "session_id": s.session_id,
+                "status": s.status.value,
+                "started_at": s.started_at,
+                "last_heartbeat": s.last_heartbeat,
+                "held_events": [
+                    {
+                        "event_id": h.event_id,
+                        "key": h.key,
+                        "offset": h.offset,
+                        "attempts": h.attempts,
+                        "lease_expires_at": h.lease_expires_at,
+                        "lease_remaining": h.lease_remaining,
+                    }
+                    for h in s.held_events
+                ],
+            }
+            for s in o.sessions
+        ],
+    }
+
+
 def create_app(queue: ReliableQueue, handler: EventHandler | None = None) -> FastAPI:
     """创建 FastAPI 应用。
 
@@ -98,9 +137,13 @@ def create_app(queue: ReliableQueue, handler: EventHandler | None = None) -> Fas
                 "POST /events", "GET /events", "GET /events/{event_id}",
                 "POST /process", "GET /dead-letters",
                 "POST /dead-letters/{event_id}/replay",
-                "GET /cursor", "POST /cursor",
+                "GET /cursor", "POST /cursor", "GET /overview",
             ],
         }
+
+    @app.get("/overview")
+    def overview() -> dict[str, Any]:
+        return overview_to_dict(queue.get_overview())
 
     @app.post("/events")
     def post_event(body: EventIn) -> dict[str, Any]:
@@ -159,6 +202,11 @@ def create_app(queue: ReliableQueue, handler: EventHandler | None = None) -> Fas
             raise HTTPException(status_code=409, detail=str(exc))
         except CursorOutOfRangeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except CursorBlockedError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(exc), "blockers": exc.blockers},
+            )
         return {"cursor": state.value, "updated_at": state.updated_at}
 
     return app

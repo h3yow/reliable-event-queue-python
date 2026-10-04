@@ -29,14 +29,19 @@ def db_path() -> str:
             pass
 
 
-@pytest.fixture
-def queue(db_path):
+@pytest.fixture(autouse=True)
+def _configure_logging():
+    """所有单测都输出处理日志：事件标识、位点、重试次数。"""
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         force=True,
     )
+
+
+@pytest.fixture
+def queue(db_path):
     q = ReliableQueue(
         db_path,
         retry_policy=RetryPolicy(max_attempts=3, base_delay=0.0,

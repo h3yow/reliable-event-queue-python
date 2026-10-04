@@ -11,12 +11,24 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from app.models import CursorState, DeadLetter, DLQStatus, Event, EventStatus
+from app.models import (
+    CursorState,
+    DeadLetter,
+    DLQStatus,
+    Event,
+    EventStatus,
+    HeldEvent,
+    QueueOverview,
+    Session,
+    SessionStatus,
+    SessionView,
+)
 
 # 从 PROCESSING 回收的认领事件（claim_at）超过该时间视为消费者崩溃
 EVENT_COLUMNS = (
     "id, `key`, type, payload, status, attempts, available_at, last_error, "
-    "result, offset, created_at, updated_at, claimed_at, dedup_expires_at"
+    "result, offset, created_at, updated_at, claimed_at, dedup_expires_at, "
+    "session_id, lease_expires_at"
 )
 
 
@@ -34,6 +46,8 @@ def _row_to_event(row: sqlite3.Row) -> Event:
         offset=row["offset"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        session_id=row["session_id"] or "",
+        lease_expires_at=row["lease_expires_at"] or 0.0,
     )
 
 
@@ -95,8 +109,30 @@ class Storage:
                 name   TEXT PRIMARY KEY,
                 value  TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id              TEXT PRIMARY KEY,
+                started_at      REAL NOT NULL,
+                last_heartbeat  REAL NOT NULL,
+                closed_at       REAL NOT NULL DEFAULT 0,
+                status          TEXT NOT NULL
+            );
             """
         )
+        # 兼容旧库：为 events 表补充会话 / 租约列（已存在则跳过）
+        existing = {
+            r["name"] for r in conn.execute("PRAGMA table_info(events)")
+        }
+        if "session_id" not in existing:
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN session_id "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "lease_expires_at" not in existing:
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN lease_expires_at "
+                "REAL NOT NULL DEFAULT 0"
+            )
         conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -285,12 +321,27 @@ class Storage:
     # ------------------------------------------------------------------ #
     # 消费
     # ------------------------------------------------------------------ #
-    def claim_due(self, now: float, limit: int) -> list[Event]:
-        """原子地认领至多 limit 条到期可投递事件（PENDING 或退避到期的
-        FAILED）。使用单条 UPDATE ... RETURNING 保证多消费者下每条事件
-        只会被一个消费者拿到。"""
+    def claim_due(
+        self,
+        now: float,
+        limit: int,
+        session_id: str = "",
+        lease_duration: float = 0.0,
+    ) -> list[Event]:
+        """原子地认领至多 limit 条可投递事件，并绑定会话租约。
+
+        可投递范围：
+        - PENDING 或退避到期的 FAILED；
+        - PROCESSING 但租约已到期（lease_expires_at<=now）的事件——
+          持有它的会话已被强杀或进程已重启，由新会话立即接管。
+
+        认领在单条 UPDATE ... RETURNING 内完成，多会话并发下每条事件
+        只会被一个会话拿到；接管时原会话的后续写入会被会话守卫拒绝，
+        因此同一事件不会被两个会话同时生效或处理两遍。
+        """
         if limit <= 0:
             return []
+        lease_expires_at = now + lease_duration if lease_duration > 0 else 0.0
         with self._tx_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -300,10 +351,14 @@ class Storage:
                         status=?,
                         claimed_at=?,
                         updated_at=?,
-                        attempts=attempts+1
+                        attempts=attempts+1,
+                        session_id=?,
+                        lease_expires_at=?
                     WHERE id IN (
                         SELECT id FROM events
-                        WHERE status IN (?, ?) AND available_at<=?
+                        WHERE (status IN (?, ?) AND available_at<=?)
+                           OR (status=? AND lease_expires_at>0
+                               AND lease_expires_at<=?)
                         ORDER BY offset
                         LIMIT ?
                     )
@@ -311,8 +366,11 @@ class Storage:
                     """,
                     (
                         EventStatus.PROCESSING.value, now, now,
+                        session_id, lease_expires_at,
                         EventStatus.PENDING.value, EventStatus.FAILED.value,
-                        now, limit,
+                        now,
+                        EventStatus.PROCESSING.value, now,
+                        limit,
                     ),
                 ).fetchall()
                 self.conn.execute("COMMIT")
@@ -329,26 +387,36 @@ class Storage:
             )
             self.conn.commit()
 
-    def mark_succeeded(self, event_id: str, result: str, now: float) -> bool:
+    def mark_succeeded(
+        self,
+        event_id: str,
+        result: str,
+        now: float,
+        session_id: str | None = None,
+    ) -> bool:
         """仅当事件仍处于 PROCESSING 时才能落成功结果，防止重复生效。
 
-        返回 True 表示本次调用真正把事件置为成功；False 表示事件已处于
-        终态（成功结果不可变）。
+        传入 session_id 时追加会话守卫：事件已被其他会话接管（租约到期
+        后被重新认领）时，旧会话的写入会被拒绝，杜绝同一条事件被两个
+        会话先后生效。返回 True 表示本次调用真正把事件置为成功。
         """
+        guard = ""
+        params: list = [EventStatus.SUCCEEDED.value, result, now, event_id,
+                        EventStatus.PROCESSING.value]
+        if session_id is not None:
+            guard = " AND session_id=?"
+            params.append(session_id)
         with self._tx_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self.conn.execute(
-                    """
+                    f"""
                     UPDATE events
                     SET status=?, result=?, last_error='', updated_at=?,
-                        claimed_at=0
-                    WHERE id=? AND status=?
+                        claimed_at=0, session_id='', lease_expires_at=0
+                    WHERE id=? AND status=?{guard}
                     """,
-                    (
-                        EventStatus.SUCCEEDED.value, result, now, event_id,
-                        EventStatus.PROCESSING.value,
-                    ),
+                    params,
                 )
                 self.conn.execute("COMMIT")
                 return cur.rowcount == 1
@@ -357,25 +425,44 @@ class Storage:
                 raise
 
     def mark_retry(
-        self, event_id: str, error: str, available_at: float, now: float
+        self,
+        event_id: str,
+        error: str,
+        available_at: float,
+        now: float,
+        session_id: str | None = None,
     ) -> None:
+        guard = ""
+        params: list = [EventStatus.FAILED.value, error, available_at, now,
+                        event_id, EventStatus.PROCESSING.value]
+        if session_id is not None:
+            guard = " AND session_id=?"
+            params.append(session_id)
         with self._tx_lock:
             self.conn.execute(
-                """
+                f"""
                 UPDATE events
                 SET status=?, last_error=?, available_at=?, updated_at=?,
-                    claimed_at=0
-                WHERE id=? AND status=?
+                    claimed_at=0, session_id='', lease_expires_at=0
+                WHERE id=? AND status=?{guard}
                 """,
-                (
-                    EventStatus.FAILED.value, error, available_at, now,
-                    event_id, EventStatus.PROCESSING.value,
-                ),
+                params,
             )
             self.conn.commit()
 
-    def mark_dead(self, event_id: str, error: str, now: float) -> None:
+    def mark_dead(
+        self,
+        event_id: str,
+        error: str,
+        now: float,
+        session_id: str | None = None,
+    ) -> None:
         """进入隔离区：事件置 DEAD，并写入/更新 dead_letters。"""
+        guard = ""
+        params: list = [EventStatus.DEAD.value, error, now, event_id]
+        if session_id is not None:
+            guard = " AND session_id=?"
+            params.append(session_id)
         with self._tx_lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -386,12 +473,13 @@ class Storage:
                 if row is None:
                     raise KeyError(event_id)
                 self.conn.execute(
-                    """
+                    f"""
                     UPDATE events
-                    SET status=?, last_error=?, updated_at=?, claimed_at=0
-                    WHERE id=?
+                    SET status=?, last_error=?, updated_at=?, claimed_at=0,
+                        session_id='', lease_expires_at=0
+                    WHERE id=?{guard}
                     """,
-                    (EventStatus.DEAD.value, error, now, event_id),
+                    params,
                 )
                 self.conn.execute(
                     """
@@ -453,7 +541,8 @@ class Storage:
                 cur = self.conn.execute(
                     """
                     UPDATE events
-                    SET status=?, claimed_at=0, updated_at=?, available_at=?
+                    SET status=?, claimed_at=0, updated_at=?, available_at=?,
+                        session_id='', lease_expires_at=0
                     WHERE status=? AND claimed_at>0 AND claimed_at<?
                     """,
                     (
@@ -466,6 +555,183 @@ class Storage:
             except Exception:
                 self.conn.execute("ROLLBACK")
                 raise
+
+    # ------------------------------------------------------------------ #
+    # 消费者会话
+    # ------------------------------------------------------------------ #
+    def register_session(self, session: Session) -> None:
+        with self._tx_lock:
+            self.conn.execute(
+                """
+                INSERT INTO sessions (id, started_at, last_heartbeat,
+                                      closed_at, status)
+                VALUES (?,?,?,?,?)
+                """,
+                (
+                    session.id, session.started_at, session.last_heartbeat,
+                    session.closed_at, session.status.value,
+                ),
+            )
+            self.conn.commit()
+
+    def heartbeat_session(self, session_id: str, now: float) -> None:
+        with self._tx_lock:
+            self.conn.execute(
+                "UPDATE sessions SET last_heartbeat=? WHERE id=? AND status=?",
+                (now, session_id, SessionStatus.ACTIVE.value),
+            )
+            self.conn.commit()
+
+    def close_session(self, session_id: str, now: float) -> None:
+        with self._tx_lock:
+            self.conn.execute(
+                "UPDATE sessions SET status=?, closed_at=? WHERE id=?",
+                (SessionStatus.CLOSED.value, now, session_id),
+            )
+            self.conn.commit()
+
+    def release_session_events(self, session_id: str, now: float) -> int:
+        """会话正常退出时干净收尾：把它仍占着的 PROCESSING 事件退回
+        FAILED 并立即可投递（available_at=now），清除会话与租约标记。
+        返回释放条数。"""
+        with self._tx_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self.conn.execute(
+                    """
+                    UPDATE events
+                    SET status=?, available_at=?, updated_at=?, claimed_at=0,
+                        session_id='', lease_expires_at=0
+                    WHERE status=? AND session_id=?
+                    """,
+                    (
+                        EventStatus.FAILED.value, now, now,
+                        EventStatus.PROCESSING.value, session_id,
+                    ),
+                )
+                self.conn.execute("COMMIT")
+                return cur.rowcount
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    def list_sessions(self) -> list[Session]:
+        with self._tx_lock:
+            rows = self.conn.execute(
+                "SELECT * FROM sessions ORDER BY started_at"
+            ).fetchall()
+            return [
+                Session(
+                    id=r["id"],
+                    started_at=r["started_at"],
+                    last_heartbeat=r["last_heartbeat"],
+                    closed_at=r["closed_at"],
+                    status=SessionStatus(r["status"]),
+                )
+                for r in rows
+            ]
+
+    # ------------------------------------------------------------------ #
+    # 位点提交守卫 / 运行概览
+    # ------------------------------------------------------------------ #
+    def blocking_events_before(self, offset: int) -> list[Event]:
+        """返回位点 offset 之前（含）所有未到最终结果（非 SUCCEEDED）的
+        事件，按位点升序。用于人工提交位点前的阻挡检查。"""
+        with self._tx_lock:
+            rows = self.conn.execute(
+                f"SELECT {EVENT_COLUMNS} FROM events "
+                "WHERE offset<=? AND status!=? ORDER BY offset",
+                (offset, EventStatus.SUCCEEDED.value),
+            ).fetchall()
+            return [_row_to_event(r) for r in rows]
+
+    def overview_snapshot(self, now: float) -> QueueOverview:
+        """在单个读事务内采集运行概览的一致快照。
+
+        计数、积压、最老待处理等待时长、位点差距与每个会话持有的
+        事件明细都来自同一快照，数字与明细必然对得上；并发消费与
+        人工重放进行期间也不会读到改到一半的状态。
+        """
+        with self._tx_lock:
+            self.conn.execute("BEGIN")
+            try:
+                counts: dict[str, int] = {
+                    s.value: 0 for s in EventStatus
+                }
+                for row in self.conn.execute(
+                    "SELECT status, COUNT(*) AS c FROM events GROUP BY status"
+                ):
+                    counts[row["status"]] = int(row["c"])
+
+                backlog = (
+                    counts[EventStatus.PENDING.value]
+                    + counts[EventStatus.FAILED.value]
+                )
+
+                row = self.conn.execute(
+                    "SELECT MIN(created_at) AS oldest FROM events "
+                    "WHERE status IN (?, ?)",
+                    (EventStatus.PENDING.value, EventStatus.FAILED.value),
+                ).fetchone()
+                oldest = row["oldest"]
+                oldest_wait = (now - oldest) if oldest is not None else 0.0
+
+                cursor_row = self.conn.execute(
+                    "SELECT value FROM meta WHERE name='cursor'"
+                ).fetchone()
+                cursor = int(cursor_row["value"]) if cursor_row else 0
+
+                max_row = self.conn.execute(
+                    "SELECT COALESCE(MAX(offset), 0) AS m FROM events"
+                ).fetchone()
+                max_offset = int(max_row["m"])
+
+                held_rows = self.conn.execute(
+                    f"SELECT {EVENT_COLUMNS} FROM events "
+                    "WHERE status=? AND session_id!='' ORDER BY offset",
+                    (EventStatus.PROCESSING.value,),
+                ).fetchall()
+
+                session_rows = self.conn.execute(
+                    "SELECT * FROM sessions ORDER BY started_at"
+                ).fetchall()
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+        held_by_session: dict[str, list[HeldEvent]] = {}
+        for r in held_rows:
+            held_by_session.setdefault(r["session_id"], []).append(
+                HeldEvent(
+                    event_id=r["id"],
+                    key=r["key"],
+                    offset=r["offset"],
+                    attempts=r["attempts"],
+                    lease_expires_at=r["lease_expires_at"],
+                    lease_remaining=r["lease_expires_at"] - now,
+                )
+            )
+        sessions = [
+            SessionView(
+                session_id=r["id"],
+                status=SessionStatus(r["status"]),
+                started_at=r["started_at"],
+                last_heartbeat=r["last_heartbeat"],
+                held_events=held_by_session.get(r["id"], []),
+            )
+            for r in session_rows
+        ]
+        return QueueOverview(
+            now=now,
+            counts=counts,
+            backlog=backlog,
+            oldest_pending_wait=oldest_wait,
+            cursor=cursor,
+            max_offset=max_offset,
+            cursor_gap=max_offset - cursor,
+            sessions=sessions,
+        )
 
     def list_events(self, limit: int = 100) -> list[Event]:
         with self._tx_lock:
